@@ -45,7 +45,9 @@ with Clunkyard;use Clunkyard;
 with Interfaces;use Interfaces;
 with Interfaces.C;use Interfaces.C;
 with System;
+with Ada.Numerics.Generic_Elementary_Functions;
 procedure Bot is
+   package Maths is new Ada.Numerics.Generic_Elementary_Functions(Real);use Maths;
    type Query is access function(Handle:System.Address;Value:access Real)return I32 with Convention=>C;
    Robot:aliased System.Address:=System.Null_Address;
    Code: I32;
@@ -66,14 +68,22 @@ procedure Bot is
    begin Status:=cy_status_text(Handle,Text'Address,U32(Text'Length));end;
    procedure Show(Handle:System.Address;Text:String;Value:Real)is Status:I32;
    begin Show(Handle,Text);Status:=cy_status_value(Handle,Value);end;
+   -- The arena's calibration kernel, xorshift-sqrt v1; safe to delete.
+   function Calibration_Work(Work,Tick:Unsigned_64)return Real is
+      X:Unsigned_64:=88_172_645_463_325_252 xor Tick;Sum:Real:=0.0;I:Unsigned_64:=0;
+   begin
+      while I<Work loop X:=X xor Shift_Left(X,13);X:=X xor Shift_Right(X,7);X:=X xor Shift_Left(X,17);Sum:=Sum+Sqrt(Real(Shift_Right(X,11)));I:=I+1;end loop;
+      return Real((Unsigned_64(Real'Floor(Sum))+Shift_Right(X,40))mod 1_000_000);
+   end;
    procedure Turn(Handle:System.Address)is
       Position,Gravity:aliased Cy_Vec3;
       Target:aliased Cy_Contact;Cue:aliased Cy_Cue;Last:aliased Cy_Scan;Aim:aliased Cy_Solution;Now:aliased Cy_Direction;
       Storm:aliased Cy_Storm;Zone:aliased Cy_Zone;
       Status:I32;Tick,Is_3d,Can_Fire:aliased I32;
       Heading,Pitch,Throttle,Error,Across,Up,Climb:aliased Real;
-      Power,Delta_Value,Bearing,Distance,Elevation,Arc,Sweep,Margin,Away,Control,Turning,Pitching:aliased Real;
+      Power,Delta_Value,Bearing,Distance,Elevation,Arc,Sweep,Margin,Away,Control,Turning,Pitching,Work:aliased Real;
       Free_Flight:Boolean;
+      Work_Path:aliased constant String:="state.calibration.work";
    begin
       Status:=cy_me_position(Handle,Position'Access);Status:=cy_arena_gravity(Handle,Gravity'Access);Status:=cy_scanner_last(Handle,Last'Access);
       Heading:=Get(Handle,cy_me_heading'Access);Pitch:=Get(Handle,cy_me_pitch'Access);
@@ -108,6 +118,8 @@ procedure Bot is
          Status:=cy_angles_angle_diff(Bearing,Heading,Delta_Value'Access);Status:=cy_angles_clamp(Delta_Value/30.0,-1.0,1.0,Turning'Access);
          Status:=cy_angles_clamp((Climb-Pitch)/30.0,-1.0,1.0,Pitching'Access);Drive(Handle,0.8,Turning,Pitching);
       end if;
+      -- Only the arena's rate calibration sends this; safe to delete.
+      if cy_raw_number(Handle,Work_Path'Address,U32(Work_Path'Length),Work'Access)=CY_OK and then Work>=1.0 then Show(Handle,"WORK",Calibration_Work(Unsigned_64(Work),Unsigned_64(Tick)));end if;
    end;
 begin
    Code:=cy_open(2,0,Name'Address,Name'Length,Version'Address,Version'Length,Robot'Access);

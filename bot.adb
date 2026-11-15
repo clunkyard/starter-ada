@@ -1,5 +1,7 @@
 -- A robot on the Clunkyard core's Ada binding. The core owns tracking,
 -- geometry and protocol handling; these procedures choose the tactics.
+-- It searches with a broad scan, narrows the beam on a contact, and leads
+-- shots from a line through its recent sightings.
 -- Clunkyard robot API 2.0.0: one core under every language, the same
 -- answers everywhere. Facts (a call shows its arguments):
 -- match: mode ruleset control robots is_3d tick_rate max_ticks
@@ -47,6 +49,8 @@ with Clunkyard;use Clunkyard;
 with Interfaces;use Interfaces;
 with Interfaces.C;use Interfaces.C;
 with System;
+with Ada.Numerics;
+with Ada.Numerics.Long_Elementary_Functions;use Ada.Numerics.Long_Elementary_Functions;
 procedure Bot is
    type Query is access function(Handle:System.Address;Value:access Real)return I32 with Convention=>C;
    Robot:aliased System.Address:=System.Null_Address;
@@ -56,6 +60,18 @@ procedure Bot is
    Version:aliased constant String:="2.0.0";
    type Contact_List is array(1..32)of aliased Cy_Contact;
    Dodge_Ticks,Dodges:Natural:=0;
+   Slot:I32:=0;
+   -- Bearing is earned: a scan contact's bearing is off by up to its bearing_error
+   -- (degrees, a fixed share of the arc), so a wide beam finds a robot and a narrow
+   -- one aims at it. Contacts within 120 units are exact.
+   Search_Arc:constant Real:=40.0;  -- degrees: sweeps the circle in half a second
+   Hold_Width:constant Real:=60.0;  -- units across at the target: it stays in the beam from tick to tick
+   Min_Arc:constant Real:=6.0;      -- degrees: the narrowest the beam holds
+   Window:constant I32:=12;         -- ticks of sightings the aim averages
+   Sightings:constant Natural:=8;   -- narrow sightings in the window before a shot
+   Look_Every:constant I32:=40;     -- ticks between looks around the target, for a nearer robot
+   Reacquire:constant I32:=10;      -- ticks to look again where a lost target was
+   type Sighting_List is array(1..32)of aliased Cy_Sighting;
    function Get(Handle:System.Address;Read:Query)return Real is
       Value:aliased Real:=0.0;Status:I32;
    begin Status:=Read(Handle,Value'Access);return Value;end;
@@ -70,6 +86,42 @@ procedure Bot is
    begin Status:=cy_status_text(Handle,Text'Address,U32(Text'Length));end;
    procedure Show(Handle:System.Address;Text:String;Value:Real)is Status:I32;
    begin Show(Handle,Text);Status:=cy_status_value(Handle,Value);end;
+   -- A straight line through the narrowest of the last Window ticks' sightings:
+   -- where the robot is now and how fast it moves. Each sighting is off by its
+   -- bearing_error; the line averages that out.
+   procedure Fit(Handle:System.Address;Target_Slot,Tick:I32;Found:out Boolean;Position,Velocity:out Cy_Vec3;Count:out Natural)is
+      History:Sighting_List;Total:aliased U32:=0;Rate:aliased I32:=0;Status:I32;
+      Recent:Natural:=0;Best:Real:=0.0;Used:array(1..32)of Boolean:=(others=>False);
+      T0,Spread,Dt,Mx,My,Mz,Sx,Sy,Sz,Now:Real:=0.0;
+   begin
+      Found:=False;Count:=0;Position:=(0.0,0.0,0.0);Velocity:=(0.0,0.0,0.0);
+      if cy_tracker_history(Handle,Target_Slot,History(1)'Access,History'Length,Total'Access)/=CY_OK then return;end if;
+      for I in 1..Integer(Total)loop
+         if History(I).tick>Tick-Window then
+            Best:=(if Recent=0 then History(I).bearing_error else Real'Min(Best,History(I).bearing_error));Recent:=Recent+1;
+         end if;
+      end loop;
+      if Recent<2 then return;end if;
+      -- Keep the narrow ones: a look's wide sighting drops out.
+      for I in 1..Integer(Total)loop
+         if History(I).tick>Tick-Window and then History(I).bearing_error<=1.5*Best then Used(I):=True;Count:=Count+1;end if;
+      end loop;
+      if Count<2 then return;end if;
+      for I in 1..Integer(Total)loop
+         if Used(I)then T0:=T0+Real(History(I).tick);Mx:=Mx+History(I).position.x;My:=My+History(I).position.y;Mz:=Mz+History(I).position.z;end if;
+      end loop;
+      T0:=T0/Real(Count);Mx:=Mx/Real(Count);My:=My/Real(Count);Mz:=Mz/Real(Count);
+      -- Least squares on each axis: slope per tick, and the line's position now.
+      for I in 1..Integer(Total)loop
+         if Used(I)then
+            Dt:=Real(History(I).tick)-T0;Spread:=Spread+Dt*Dt;
+            Sx:=Sx+Dt*(History(I).position.x-Mx);Sy:=Sy+Dt*(History(I).position.y-My);Sz:=Sz+Dt*(History(I).position.z-Mz);
+         end if;
+      end loop;
+      Status:=cy_match_tick_rate(Handle,Rate'Access);Now:=Real(Tick)-T0;
+      Sx:=Sx/Spread;Sy:=Sy/Spread;Sz:=Sz/Spread;
+      Position:=(Mx+Sx*Now,My+Sy*Now,Mz+Sz*Now);Velocity:=(Sx*Real(Rate),Sy*Real(Rate),Sz*Real(Rate));Found:=True;
+   end;
    procedure Turn(Handle:System.Address)is
       Position,Gravity:aliased Cy_Vec3;
       Target:aliased Cy_Contact;Cue:aliased Cy_Cue;Last:aliased Cy_Scan;Aim:aliased Cy_Solution;Now:aliased Cy_Direction;
@@ -77,23 +129,45 @@ procedure Bot is
       Status:I32;Tick,Is_3d,Can_Fire:aliased I32;
       Heading,Pitch,Throttle,Error,Across,Up,Climb:aliased Real;
       Power,Delta_Value,Bearing,Distance,Elevation,Arc,Sweep,Margin,Away,Control,Turning,Pitching:aliased Real;
-      Free_Flight:Boolean;
+      Free_Flight,Seen,Found,Aimed,Ready:Boolean;Last_Seen:aliased I32:=0;Fit_Count:Natural;
+      Fit_Position,Fit_Velocity,Where:aliased Cy_Vec3;Hold:Real;
       Cues:Contact_List;Count:aliased U32:=0;Fired:Boolean:=False;Mode:aliased I32;Left:Boolean;Side:Real;
    begin
       Status:=cy_me_position(Handle,Position'Access);Status:=cy_arena_gravity(Handle,Gravity'Access);Status:=cy_scanner_last(Handle,Last'Access);
       Heading:=Get(Handle,cy_me_heading'Access);Pitch:=Get(Handle,cy_me_pitch'Access);
       Status:=cy_clock_tick(Handle,Tick'Access);Status:=cy_match_is_3d(Handle,Is_3d'Access);Free_Flight:=Is_3d/=0 and then Gravity.Z=0.0;
       Status:=cy_drive_brake(Handle,0.2);
+      Seen:=Slot/=0 and then cy_tracker_last_seen(Handle,Slot,Last_Seen'Access)=CY_OK;
       if cy_sensors_nearest(Handle,Target'Access)=CY_OK then
+         Slot:=Target.slot;
          Throttle:=0.2;if Target.Range_Value>350.0 then Throttle:=0.7;elsif Target.Range_Value<200.0 then Throttle:=-0.4;end if;
-         Drive(Handle,Throttle,Steer(Target.Bearing,Heading),Steer(Target.Elevation,Pitch));Scan(Handle,Target.Bearing,20.0,Target.Elevation);
-         -- cy_gun_lead is the intercept if the target holds course.
+         Drive(Handle,Throttle,Steer(Target.Bearing,Heading),Steer(Target.Elevation,Pitch));
+         -- Halve the beam each tick until it is Hold_Width across at the target:
+         -- narrow enough for a precise bearing, wide enough to keep it in.
+         Hold:=Real'Max(Min_Arc,2.0*Real(Arctan(Long_Float(Hold_Width/2.0),Long_Float(Target.Range_Value)))*180.0/Ada.Numerics.Pi);
+         -- In a crowd a narrow beam sees one robot. Every Look_Every ticks, widen it for a tick.
+         if Tick mod Look_Every=0 then Arc:=Search_Arc;else Arc:=Real'Max(Hold,Real'Min(Search_Arc,Last.Arc/2.0));end if;
+         Scan(Handle,Target.Bearing,Arc,Target.Elevation);
          Status:=cy_gun_power_for_flight_time(Handle,Target.Range_Value,1.0,Power'Access);
-         if cy_gun_lead(Handle,Target'Access,Power,Aim'Access)/=CY_OK then Aim.Heading:=Target.Bearing;Aim.Pitch:=Target.Elevation;end if;
+         if Target.Bearing_Error>0.0 then
+            -- A noisy contact: lead the fitted line, and fire only once it rests on enough sightings.
+            Fit(Handle,Target.slot,Tick,Found,Fit_Position,Fit_Velocity,Fit_Count);
+            Aimed:=Found and then cy_gun_lead_point(Handle,Fit_Position'Access,Fit_Velocity'Access,Power,Aim'Access)=CY_OK;
+            Ready:=Aimed and then Fit_Count>=Sightings;
+         else
+            -- An exact contact: cy_gun_lead is the intercept if the target holds course.
+            Aimed:=cy_gun_lead(Handle,Target'Access,Power,Aim'Access)=CY_OK;Ready:=True;
+         end if;
+         if not Aimed then Aim.Heading:=Target.Bearing;Aim.Pitch:=Target.Elevation;end if;
          Status:=cy_gun_aim_heading(Handle,Aim.Heading);Status:=cy_gun_aim_pitch(Handle,Aim.Pitch);
          Status:=cy_gun_aim_now(Handle,Now'Access);Status:=cy_angles_angle_diff(Aim.Heading,Now.Heading,Delta_Value'Access);Status:=cy_gun_can_fire(Handle,Power,10.0,Can_Fire'Access);
-         if abs Delta_Value<3.0 and then abs(Aim.Pitch-Now.Pitch)<3.0 and then Can_Fire/=0 then Status:=cy_gun_fire(Handle);Status:=cy_gun_power(Handle,Power);end if;
-         Show(Handle,"TRACK",Target.Range_Value);
+         if Ready and then abs Delta_Value<3.0 and then abs(Aim.Pitch-Now.Pitch)<3.0 and then Can_Fire/=0 then Status:=cy_gun_fire(Handle);Status:=cy_gun_power(Handle,Power);end if;
+         Show(Handle,(if Ready then "TRACK" else "NARROW"),Target.Range_Value);
+      elsif Seen and then Tick-Last_Seen<=Reacquire then
+         -- Lost it: look again where it was last seen, widening the beam, before searching.
+         Status:=cy_tracker_position(Handle,Slot,Where'Access);Status:=cy_angles_bearing_to(Position'Access,Where'Access,Bearing'Access);
+         Elevation:=0.0;if Free_Flight then Status:=cy_angles_elevation_to(Position'Access,Where'Access,Elevation'Access);end if;
+         Drive(Handle,0.5,Steer(Bearing,Heading),Steer(Elevation,Pitch));Scan(Handle,Bearing,Real'Min(Search_Arc,Last.Arc*2.0),Elevation);Show(Handle,"REACQUIRE");
       elsif cy_tracker_cue(Handle,Cue'Access)=CY_OK then
          Status:=cy_angles_bearing_to(Position'Access,Cue.Position'Access,Bearing'Access);Status:=cy_angles_distance(Position'Access,Cue.Position'Access,Distance'Access);
          Elevation:=0.0;if Free_Flight then Status:=cy_angles_elevation_to(Position'Access,Cue.Position'Access,Elevation'Access);end if;
@@ -102,7 +176,7 @@ procedure Bot is
          Scan(Handle,Bearing+Across,Arc,Elevation+Up);Show(Handle,"CUE",Distance);
       else
          Status:=cy_angles_normalize(Last.Heading+36.0,Sweep'Access);Up:=0.0;if Free_Flight then Up:=Real((Tick/10)mod 3-1)*35.0;end if;
-         Drive(Handle,0.5,0.33,Steer(0.0,Pitch));Scan(Handle,Sweep,40.0,Up);Show(Handle,"SEARCH");
+         Drive(Handle,0.5,0.33,Steer(0.0,Pitch));Scan(Handle,Sweep,Search_Arc,Up);Show(Handle,"SEARCH");
       end if;
       -- A simple dodge: vary it, or predict the shooter.
       if cy_sensors_cues(Handle,Cues(1)'Access,Cues'Length,Count'Access)=CY_OK then

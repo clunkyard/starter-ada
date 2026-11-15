@@ -7,7 +7,8 @@
 -- clock: tick seconds remaining_ticks
 -- arena: size gravity terrain_kind ground_height(x y)
 -- me: health position velocity heading pitch roll angular_velocity
---   attitude grounded altitude applied
+--   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+--   from_mount(heading pitch) mount_toward(point)
 -- battery: charge capacity regen sustainable_drive compute
 --   drive_cost(fraction)
 -- drive: hover_lift
@@ -29,7 +30,8 @@
 -- score: me best armour
 -- angles: normalize(degrees) angle_diff(target current)
 --   bearing_to(from to) elevation_to(from to) direction(heading pitch)
---   distance(a b) clamp(value low high)
+--   distance(a b) to_chassis(heading pitch attitude)
+--   from_chassis(heading pitch attitude) clamp(value low high)
 -- raw: number(path) text(path) has(path) flag(path) count(path) line()
 -- Controls: drive.set(throttle turn pitch_turn)
 --   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -52,6 +54,8 @@ procedure Bot is
    Event:aliased I32;
    Name:aliased constant String:="clunkyard-ada";
    Version:aliased constant String:="2.0.0";
+   type Contact_List is array(1..32)of aliased Cy_Contact;
+   Dodge_Ticks,Dodges:Natural:=0;
    function Get(Handle:System.Address;Read:Query)return Real is
       Value:aliased Real:=0.0;Status:I32;
    begin Status:=Read(Handle,Value'Access);return Value;end;
@@ -74,6 +78,7 @@ procedure Bot is
       Heading,Pitch,Throttle,Error,Across,Up,Climb:aliased Real;
       Power,Delta_Value,Bearing,Distance,Elevation,Arc,Sweep,Margin,Away,Control,Turning,Pitching:aliased Real;
       Free_Flight:Boolean;
+      Cues:Contact_List;Count:aliased U32:=0;Fired:Boolean:=False;Mode:aliased I32;Left:Boolean;Side:Real;
    begin
       Status:=cy_me_position(Handle,Position'Access);Status:=cy_arena_gravity(Handle,Gravity'Access);Status:=cy_scanner_last(Handle,Last'Access);
       Heading:=Get(Handle,cy_me_heading'Access);Pitch:=Get(Handle,cy_me_pitch'Access);
@@ -82,6 +87,7 @@ procedure Bot is
       if cy_sensors_nearest(Handle,Target'Access)=CY_OK then
          Throttle:=0.2;if Target.Range_Value>350.0 then Throttle:=0.7;elsif Target.Range_Value<200.0 then Throttle:=-0.4;end if;
          Drive(Handle,Throttle,Steer(Target.Bearing,Heading),Steer(Target.Elevation,Pitch));Scan(Handle,Target.Bearing,20.0,Target.Elevation);
+         -- cy_gun_lead is the intercept if the target holds course.
          Status:=cy_gun_power_for_flight_time(Handle,Target.Range_Value,1.0,Power'Access);
          if cy_gun_lead(Handle,Target'Access,Power,Aim'Access)/=CY_OK then Aim.Heading:=Target.Bearing;Aim.Pitch:=Target.Elevation;end if;
          Status:=cy_gun_aim_heading(Handle,Aim.Heading);Status:=cy_gun_aim_pitch(Handle,Aim.Pitch);
@@ -97,6 +103,19 @@ procedure Bot is
       else
          Status:=cy_angles_normalize(Last.Heading+36.0,Sweep'Access);Up:=0.0;if Free_Flight then Up:=Real((Tick/10)mod 3-1)*35.0;end if;
          Drive(Handle,0.5,0.33,Steer(0.0,Pitch));Scan(Handle,Sweep,40.0,Up);Show(Handle,"SEARCH");
+      end if;
+      -- A simple dodge: vary it, or predict the shooter.
+      if cy_sensors_cues(Handle,Cues(1)'Access,Cues'Length,Count'Access)=CY_OK then
+         for I in 1..Integer(Count)loop Fired:=Fired or else Cues(I).source=CY_SOURCE_MUZZLE;end loop;
+      end if;
+      if Dodge_Ticks=0 and then Fired then Dodges:=Dodges+1;Dodge_Ticks:=10;end if;
+      if Dodge_Ticks>0 then
+         -- Odd dodges go left, even ones right; turn +1 and strafe -1 go left.
+         Left:=Dodges mod 2=1;Side:=(if Left then 1.0 else -1.0);Dodge_Ticks:=Dodge_Ticks-1;
+         Status:=cy_match_control(Handle,Mode'Access);
+         if Mode=CY_CONTROL_FORCES then Status:=cy_drive_throttle(Handle,0.5);Status:=cy_drive_strafe(Handle,-Side);
+         else Status:=cy_drive_throttle(Handle,1.0);Status:=cy_drive_turn(Handle,Side);end if;
+         Show(Handle,(if Left then "dodge:left" else "dodge:right"),Real(Dodges));
       end if;
       if Get(Handle,cy_battery_charge'Access)<Get(Handle,cy_battery_capacity'Access)/4.0 then Status:=cy_drive_throttle(Handle,Get(Handle,cy_drive_get_throttle'Access)*0.5);end if;
       if cy_nav_storm(Handle,Storm'Access)=CY_OK and then cy_nav_storm_margin(Handle,Position'Access,Margin'Access)=CY_OK and then Margin> -60.0 then
